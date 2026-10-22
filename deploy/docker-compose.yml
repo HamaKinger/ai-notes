@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai-notes-postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ainotes
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ainotes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    container_name: ai-notes-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: ai-notes-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  # 可选:完全本地化的模型(Ollama)
+  ollama:
+    image: ollama/ollama
+    container_name: ai-notes-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    profiles:
+      - local-models
+
+  backend:
+    build: ../backend
+    container_name: ai-notes-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ainotes
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_ELASTICSEARCH_URIS: http://elasticsearch:9200
+      # 注意:这里的默认值走 compose 里的本地 Ollama(自包含、离线可用),与
+      # application.yml 的默认值(云端百炼)不同 —— 两者都是 1024 维,索引通用。
+      # 想用云端,把 AI_CHAT_BASE_URL / AI_CHAT_API_KEY / 模型名通过环境变量传进来即可。
+      AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-http://ollama:11434/v1}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-qwen2.5:7b}
+      AI_CHAT_API_KEY: ${AI_CHAT_API_KEY:-change-me}
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-bge-m3}
+      AI_EMBEDDING_DIMENSIONS: ${AI_EMBEDDING_DIMENSIONS:-1024}
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build: ../frontend
+    container_name: ai-notes-frontend
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8080/api/v1
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  esdata:
+  redisdata:
+  ollama:

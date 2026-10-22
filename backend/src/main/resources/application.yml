@@ -1,0 +1,186 @@
+spring:
+  application:
+    name: ai-notes
+
+  # 本项目检索走自定义 ChunkIndexStore(Rest5Client),索引由 EsIndexInitializer
+  # 按 resources/elasticsearch/chunk-index.json 创建(IK 分词 + HNSW)。Spring AI 的
+  # vectorStore 自动配置与该项目设计根本冲突:它启动时急切调用 indexExists(),
+  # 索引不存在且 initialize-schema=false 时会抛 "Index not found" 直接导致启动失败,
+  # 若改成 true 又会用裸 mapping 覆盖 IK 配置。因此必须排除,依赖保留即可。
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.vectorstore.elasticsearch.autoconfigure.ElasticsearchVectorStoreAutoConfiguration
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://wolas.cn:5432/ainotes}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+    hikari:
+      # 连接池(HikariCP)。数值与默认值一致,显式写出来便于按部署调整。
+      # 事务只包住数据库写入,外部调用(嵌入、ES、模型)不占连接,所以 10 对单机足够。
+      maximum-pool-size: ${AI_NOTES_DB_POOL_MAX:10}
+      # 取不到连接时最多等多久,超时直接报错,而不是让请求无限挂住
+      connection-timeout: ${AI_NOTES_DB_CONN_TIMEOUT:30000}
+
+  jpa:
+    # 表结构由 Flyway 管理,这里不做 DDL
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  mvc:
+    # 流式问答走 SSE(SSE = 一次异步请求,响应体是一串事件)。不设这一条的话,超时时间由
+    # 容器决定(Tomcat 默认 30s),慢回答会被从中间掐断、前端收到"网络错误"。
+    # 设成有限值而不是 -1(永不超时):模型真的卡住时连接总得有个了断。
+    async:
+      # 异步请求(SSE)的总时限。注意这是**整段流**的上限,不是"空闲多久算超时":
+      # 一次 Agent 运行可能要好几分钟(每步一次模型调用,8 步 + 最后的长回答),
+      # 之前 180s 是给单轮对话留的,多步任务很容易撞上 —— 撞上时前端表现为流被无声掐断。
+      # 它必须大于 spring.ai.openai.timeout(单次模型调用)叠加出来的最坏情况。
+      request-timeout: ${AI_NOTES_ASYNC_TIMEOUT:600s}
+
+  servlet:
+    multipart:
+      max-file-size: ${AI_NOTES_MAX_FILE_SIZE:50MB}
+      max-request-size: ${AI_NOTES_MAX_REQUEST_SIZE:60MB}
+
+  # Elasticsearch:检索索引(M3 起使用;当前不依赖 ES 也能启动)
+  elasticsearch:
+    uris: ${SPRING_ELASTICSEARCH_URIS:http://wolas.cn:9200}
+    username: ${SPRING_ELASTICSEARCH_USERNAME:elastic}
+    password: ${SPRING_ELASTICSEARCH_PASSWORD:Elastic_FhnMSF}
+
+  ai:
+    openai:
+      # 任意非空值即可;真实密钥建议用 AI_CHAT_API_KEY 环境变量覆盖。
+      # ⚠️ 当前这里的默认值是一把真实密钥(明文写在源码里,方便本地调试)。
+      #    提交进 git 之前务必清空,或改成 ${AI_CHAT_API_KEY} 并在环境变量里配。
+      api-key: ${AI_CHAT_API_KEY:sk-demdaeowvvxlmfgcbzjwehbpmchjdqjygncdenysognfkauf}
+      # OpenAI 兼容端点。对话与嵌入共用这一个连接配置(Spring AI 的 base-url/api-key 在
+      # chat 与 embedding 之间是共享的),因此这里选一个同时提供两类模型的服务商更省事:
+      # 硅基流动同时提供 Qwen 系列对话模型与 BAAI/bge-m3 嵌入模型。
+      # ⚠️ base-url 只能填到 /v1 为止:客户端会在它后面自己拼 /embeddings、/chat/completions。
+      #    填成某个具体接口(例如 .../v1/rerank)会被拼成 .../v1/rerank/embeddings,得到 404。
+      # 注意:它必须能连通,否则嵌入会失败(见 IndexingService)。
+      base-url: ${AI_CHAT_BASE_URL:https://api.siliconflow.cn/v1}
+      # 单次请求的**总时限**(OpenAI 官方 SDK 的 request timeout,Spring AI 默认 60s)。
+      # 这不是"聊天最多等多久"的体验开关,而是硬超时:超过它 okhttp 会直接把正在读的 SSE 流掐掉
+      # (日志里是 InterruptedIOException: timeout → stream was reset: CANCEL)。
+      # 60s 太紧:实测多轮 Agent 跑到第 8 轮时,服务商因为上下文已经很长而迟迟不出数据,
+      # 整轮就这样被掐断 —— 用户看到的是"查了半天,最后突然报错"。
+      # ⚠️ 写在这里(**common**)而不是 spring.ai.openai.chat.timeout:2.0 的自动装配建客户端时
+      #     读的是 OpenAiCommonProperties,chat 段里的 timeout 不参与建客户端(实测无效)。
+      # 服务端 spring.mvc.async.request-timeout 是 180s,所以别设得比它还小。
+      timeout: ${AI_CHAT_TIMEOUT:5m}
+      chat:
+        options:
+          # M4 才会用到;模型名必须与 base-url 同源,否则同样 404(不校验模型名的服务商除外)
+          model: ${AI_CHAT_MODEL:Qwen/Qwen3-8B}
+          temperature: 0.7
+          # Qwen3 这类"思考模型"默认开着思考模式:出第一个可见字之前要干等十几秒
+          #(实测同一句话:开思考 29s、关思考 1.9s),而思考内容走的是 delta.reasoning_content
+          # —— Spring AI 只认 delta.content,于是面板上就是长时间没反应。
+          # 硅基流动的 OpenAI 兼容接口用**顶层**参数 enable_thinking 关掉它;
+          # 写成 chat_template_kwargs.enable_thinking 它不认(实测仍然思考)。
+          # 键名带下划线,用 [] 包起来是 Spring Boot 的写法:方括号里的键原样传给服务商。
+          # ⚠️ 这里必须写**布尔字面量**,不能写成 ${AI_NOTES_ENABLE_THINKING:false}:
+          #    占位符解析到 Map<String,Object> 时不做类型转换,发出去是字符串 "false",
+          #    硅基流动会直接拒绝(400 / code 20015 The parameter is invalid —— 实测踩过)。
+          # 想开回思考模式:把 false 改成 true。换服务商(尤其 OpenAI 官方)时删掉这段,
+          #    未知字段可能被直接拒绝。命令行临时覆盖:
+          #    --spring.ai.openai.chat.options.extra-body.[enable_thinking]=true
+          extra-body:
+            "[enable_thinking]": false
+      embedding:
+        options:
+          # 硅基流动 BAAI/bge-m3,输出 1024 维 —— 与 chunk-index.json 的 embedding.dims
+          # 一致,所以用这个模型不需要改索引 mapping。
+          # 换用维度不同的模型时必须同步改 AI_EMBEDDING_DIMENSIONS 与 chunk-index.json,
+          # 并删掉重建索引(维度不匹配会在 ChunkEmbeddingService 里被直接拦下并报错)。
+          model: ${AI_EMBEDDING_MODEL:BAAI/bge-m3}
+    vectorstore:
+      elasticsearch:
+        # 该段在排除 ElasticsearchVectorStoreAutoConfiguration 之后**不再生效**,
+        # 保留只为表明"向量维度/相似度"的取值来源。索引仍由后端 EsIndexInitializer
+        # 按 resources/elasticsearch/chunk-index.json 创建,initialize-schema 始终不启用,
+        # 否则 mapping 会被裸配置覆盖、丢掉 IK 分词器。
+        initialize-schema: false
+        index-name: ai-notes-chunk
+        dimensions: ${AI_EMBEDDING_DIMENSIONS:1024}
+        similarity: cosine
+
+server:
+  port: ${SERVER_PORT:8080}
+
+ai-notes:
+  cors:
+    # 逗号分隔;默认同时放行局域网域名与本地回环,便于本机起前端连远程后端
+    allowed-origins: ${AI_NOTES_CORS_ORIGINS:http://localhost:3000,http://wolas.cn:3000}
+  security:
+    # false(默认):服务端强制鉴权 —— 除 /api/v1/auth/** 与健康检查外,一律要求 Bearer Token。
+    # true:未携带 Token 的请求也放行,未登录时回落到演示账号。仅供本地调试
+    #       (想直接用 curl 打接口、不想先换 Token 时显式置 true)。
+    # 前端已有路由守卫,但守卫只是界面体验;真正的访问控制由这里决定。
+    dev-permit-all: ${AI_NOTES_DEV_PERMIT_ALL:false}
+    jwt:
+      # HS256 需要至少 256 bit(32 字节),生产请务必用环境变量覆盖
+      secret: ${AI_NOTES_JWT_SECRET:dev-only-secret-please-change-me-0123456789}
+      ttl: ${AI_NOTES_JWT_TTL:PT168H}
+    # dev-permit-all=true 且未登录时,回落到该演示账号
+    demo-user-email: ${AI_NOTES_DEMO_EMAIL:demo@ai-notes.local}
+  search:
+    index: ${AI_NOTES_ES_INDEX:ai-notes-chunk}
+    max-chars-per-chunk: ${AI_NOTES_CHUNK_MAX_CHARS:800}
+    # 必须与 resources/elasticsearch/chunk-index.json 里的 embedding.dims 相同。
+    # 不一致时不会静默降级,而是直接报错并说明怎么改(见 ChunkEmbeddingService)。
+    embedding-dimensions: ${AI_EMBEDDING_DIMENSIONS:1024}
+    # RRF 融合的 rank constant(经验值 60)。越小则各路头部结果的优势越明显。
+    rrf-rank-constant: ${AI_NOTES_RRF_RANK_CONSTANT:60}
+  ai:
+    # RAG:每次提问检索几段笔记喂给模型。片段上限 800 字(chunk 大小),6 段 ≈ 5k 字符上下文,
+    # 对 8B 模型够用;调大既贵又容易把不相关的段落塞进去。
+    rag-top-k: ${AI_NOTES_RAG_TOP_K:6}
+    # 历史窗口:带上最近多少条消息(含助手的回答)。太大既费 token,又会把早就聊完的话题
+    # 重新拖进上下文;太小则"再详细说说"这类追问接不上。
+    history-window: ${AI_NOTES_AI_HISTORY_WINDOW:20}
+    # 文本工具(选中文本操作 / 摘要 / 标签)单次处理的原文字数上限。
+    # 选中文本超过它**直接报错**(截断会让"替换选中"把后半段删掉);整篇摘要/标签则截断处理,
+    # 并在正文末尾注明"已截断"。
+    max-input-chars: ${AI_NOTES_AI_MAX_INPUT_CHARS:6000}
+  agent:
+    # M5:一次运行最多几步(一次模型调用算一步)。这不是"性能参数"而是**安全阀**:
+    # 8B 模型偶尔会陷进"搜一遍、没找到、换个词再搜"的循环里,没有上限就会一直烧 token。
+    # 到顶时运行以 STEP_LIMIT 结束,已经生成的部分照常保留。
+    # 12 而不是更小:典型的"整理本周笔记成周报"要 listNotes 一次、读两三篇、再写一篇,
+    # 8 步会在写之前就用光(实测读 5 篇就到顶了)。
+    max-steps: ${AI_NOTES_AGENT_MAX_STEPS:12}
+    # 工具往模型上下文里塞一篇笔记正文的字数上限(getNote)。一篇长笔记整个塞回去会挤掉
+    # 其它片段、也拖慢每一轮;超限截断并在末尾注明。
+    max-note-chars: ${AI_NOTES_AGENT_MAX_NOTE_CHARS:4000}
+  memory:
+    # M5 Step 3:长期记忆。记忆只由 rememberFact 写入(经确认);提问时按语义召回,注入系统提示词。
+    index: ${AI_NOTES_MEMORY_INDEX:ai-notes-memory}
+    # 每次提问最多召回几条
+    recall-top-k: ${AI_NOTES_MEMORY_RECALL_TOP_K:5}
+    # ES 相似度分(cosine 下约 0~1)低于它的不召回。阈值要真机看几次再定,偏高会"记了也想不起来",偏低会"无关的也带上"
+    recall-min-score: ${AI_NOTES_MEMORY_RECALL_MIN_SCORE:0.7}
+    # 新事实与已有记忆的相似度达到它就视为重复,不再记一条
+    dedup-score: ${AI_NOTES_MEMORY_DEDUP_SCORE:0.95}
+  storage:
+    root: ${AI_NOTES_STORAGE_ROOT:./data}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  health:
+    elasticsearch:
+      enabled: false

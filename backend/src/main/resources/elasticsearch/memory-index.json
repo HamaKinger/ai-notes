@@ -1,0 +1,20 @@
+{
+  "mappings": {
+    "properties": {
+      "workspace_id": { "type": "keyword" },
+      "memory_id": { "type": "keyword" },
+      "content": { "type": "text" },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1024,
+        "index": true,
+        "similarity": "cosine",
+        "index_options": {
+          "type": "hnsw",
+          "m": 16,
+          "ef_construction": 100
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# ---- Java / Maven ----
+backend/target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---- Node / Next.js ----
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+*.tsbuildinfo
+
+# ---- 环境与本地配置 ----
+.env
+.env.local
+*.local
+
+# ---- 本地数据(附件存储等) ----
+backend/data/
+data/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# ---- 日志 ----
+*.log
